@@ -205,7 +205,7 @@ class PPGAnalyzerSuite(QMainWindow):
         self.fft_ppg_plot.setLabel('left', "Biên độ")
         splitter_fft.addWidget(self.fft_ppg_plot)
         
-        self.fft_widget = pg.PlotWidget(title="Phân tích Phổ Tần Số (FFT) - Tìm nguồn nhiễu")
+        self.fft_widget = pg.PlotWidget(title="Phân tích Phổ Tần Số (FFT)")
         self.fft_widget.showGrid(x=True, y=True, alpha=0.3)
         self.fft_widget.setLabel('bottom', "Tần số (Hz)")
         self.fft_widget.setLabel('left', "Biên độ (Magnitude)")
@@ -383,6 +383,10 @@ class PPGAnalyzerSuite(QMainWindow):
             return
             
         signal = self.offline_signal
+        if len(signal) < 100:
+            QMessageBox.warning(self, "Lỗi phân tích", "Dữ liệu quá ngắn (ít hơn 100 mẫu). Không thể tính toán FFT hoặc đạo hàm.")
+            return
+
         signal_no_dc = signal - np.mean(signal)
         
         # 1. Tính toán VPG và APG
