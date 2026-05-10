@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QComboBox, QLabel, QTabWidget, 
                              QFileDialog, QMessageBox, QSplitter, QSpinBox, QCheckBox)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
+from PyQt6.QtGui import QShortcut, QKeySequence
 import pyqtgraph as pg
 import pyqtgraph.exporters
 import pandas as pd
@@ -57,6 +58,14 @@ class SerialThread(QThread):
                                 self.new_data.emit(t, s, p, z)
                             except ValueError:
                                 pass 
+                        elif len(parts) == 1: # Raw signal từ ppgraw.ino (1 cột)
+                            try:
+                                p = float(parts[0])
+                                # Ghi NaN cho các cột không có
+                                self.csv_writer.writerow([np.nan, np.nan, p, np.nan])
+                                self.new_data.emit(np.nan, np.nan, p, np.nan)
+                            except ValueError:
+                                pass
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -114,6 +123,17 @@ class PPGAnalyzerSuite(QMainWindow):
         self.setup_live_tab()
         self.setup_offline_tab()
         
+        # Phím tắt Hoàn tác / Làm lại cho thước tạm
+        self.shortcut_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.shortcut_undo.activated.connect(self.undo_temp_ruler)
+        
+        self.shortcut_redo = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self.shortcut_redo.activated.connect(self.redo_temp_ruler)
+        
+        # Phím tắt chuyển đổi chế độ chấm đỏ
+        self.shortcut_dot = QShortcut(QKeySequence("Ctrl+D"), self)
+        self.shortcut_dot.activated.connect(self.toggle_dot_mode)
+        
     def setup_live_tab(self):
         layout = QVBoxLayout(self.tab_live)
         
@@ -136,11 +156,14 @@ class PPGAnalyzerSuite(QMainWindow):
         self.spin_window.setSuffix(" mẫu")
         self.spin_window.valueChanged.connect(self.change_window_size)
         
+        self.cb_invert_live = QCheckBox("Lật ngược")
+        
         controls.addWidget(QLabel("Cổng COM:"))
         controls.addWidget(self.cb_ports)
         controls.addWidget(self.btn_refresh)
         controls.addWidget(QLabel(" | Khung hiển thị:"))
         controls.addWidget(self.spin_window)
+        controls.addWidget(self.cb_invert_live)
         controls.addWidget(self.btn_connect)
         controls.addStretch()
         layout.addLayout(controls)
@@ -161,6 +184,13 @@ class PPGAnalyzerSuite(QMainWindow):
         
         layout.addWidget(self.plot_widget)
         
+        # Thêm Crosshair
+        self.vLine_live = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('gray', style=Qt.PenStyle.DashLine))
+        self.plot_widget.addItem(self.vLine_live, ignoreBounds=True)
+        self.label_live = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 255, 200))
+        self.plot_widget.addItem(self.label_live, ignoreBounds=True)
+        self.proxy_live = pg.SignalProxy(self.plot_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouseMoved_live)
+        
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
         self.timer.start(20) # 20ms
@@ -177,6 +207,9 @@ class PPGAnalyzerSuite(QMainWindow):
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.clicked.connect(self.analyze_data)
         
+        self.cb_invert_offline = QCheckBox("Lật ngược tín hiệu")
+        self.cb_invert_offline.stateChanged.connect(self.on_invert_changed)
+        
         self.btn_export_fft = QPushButton("Lưu ảnh Tab FFT")
         self.btn_export_fft.clicked.connect(self.export_fft)
         
@@ -185,6 +218,7 @@ class PPGAnalyzerSuite(QMainWindow):
         
         controls.addWidget(self.btn_load_csv)
         controls.addWidget(self.btn_analyze)
+        controls.addWidget(self.cb_invert_offline)
         controls.addStretch()
         controls.addWidget(self.btn_export_fft)
         controls.addWidget(self.btn_export_time)
@@ -230,11 +264,25 @@ class PPGAnalyzerSuite(QMainWindow):
         splitter_fft.setSizes([400, 600])
         layout_fft.addWidget(splitter_fft)
         
+        # --- Crosshair cho FFT Tab ---
+        self.vLine_fft_ppg = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('gray', style=Qt.PenStyle.DashLine))
+        self.vLine_fft = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('gray', style=Qt.PenStyle.DashLine))
+        self.fft_ppg_plot.addItem(self.vLine_fft_ppg, ignoreBounds=True)
+        self.fft_widget.addItem(self.vLine_fft, ignoreBounds=True)
+        
+        self.label_fft_ppg = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 255, 200))
+        self.label_fft = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 255, 200))
+        self.fft_ppg_plot.addItem(self.label_fft_ppg, ignoreBounds=True)
+        self.fft_widget.addItem(self.label_fft, ignoreBounds=True)
+        
+        self.proxy_fft_ppg = pg.SignalProxy(self.fft_ppg_plot.scene().sigMouseMoved, rateLimit=60, slot=self.mouseMoved_fft_ppg)
+        self.proxy_fft_widget = pg.SignalProxy(self.fft_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouseMoved_fft_widget)
+        
         # --- TAB 2: ĐẠO HÀM (VPG/APG) ---
         self.sub_tab_deriv = QWidget()
         layout_deriv = QVBoxLayout(self.sub_tab_deriv)
         
-        # Cụm Checkbox Ẩn/Hiện
+        # Cụm Checkbox Ẩn/Hiện và nút xóa thước
         chk_layout = QHBoxLayout()
         self.cb_show_vpg = QCheckBox("Hiển thị VPG (Bậc 1)")
         self.cb_show_vpg.setChecked(True)
@@ -244,9 +292,17 @@ class PPGAnalyzerSuite(QMainWindow):
         self.cb_show_apg.setChecked(True)
         self.cb_show_apg.stateChanged.connect(self.toggle_apg)
         
+        self.cb_dot_mode = QCheckBox("Chấm đỏ (Ctrl+D)")
+        self.cb_dot_mode.setChecked(False)
+        
+        self.btn_clear_rulers = QPushButton("Xóa các đánh dấu tạm")
+        self.btn_clear_rulers.clicked.connect(self.clear_temp_rulers)
+        
         chk_layout.addWidget(self.cb_show_vpg)
         chk_layout.addWidget(self.cb_show_apg)
+        chk_layout.addWidget(self.cb_dot_mode)
         chk_layout.addStretch()
+        chk_layout.addWidget(self.btn_clear_rulers)
         layout_deriv.addLayout(chk_layout)
         
         self.deriv_time_widget = pg.GraphicsLayoutWidget()
@@ -269,6 +325,26 @@ class PPGAnalyzerSuite(QMainWindow):
         self.apg_plot.setXLink(self.deriv_ppg_plot) # Đồng bộ trục X
         
         layout_deriv.addWidget(self.deriv_time_widget)
+        
+        # --- Crosshair cho Đạo hàm Tab ---
+        self.vLine_deriv_ppg = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('gray', style=Qt.PenStyle.DashLine))
+        self.vLine_vpg = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('gray', style=Qt.PenStyle.DashLine))
+        self.vLine_apg = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('gray', style=Qt.PenStyle.DashLine))
+        
+        self.deriv_ppg_plot.addItem(self.vLine_deriv_ppg, ignoreBounds=True)
+        self.vpg_plot.addItem(self.vLine_vpg, ignoreBounds=True)
+        self.apg_plot.addItem(self.vLine_apg, ignoreBounds=True)
+        
+        self.label_deriv_ppg = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 255, 200))
+        self.label_vpg = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 255, 200))
+        self.label_apg = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 255, 200))
+        
+        self.deriv_ppg_plot.addItem(self.label_deriv_ppg, ignoreBounds=True)
+        self.vpg_plot.addItem(self.label_vpg, ignoreBounds=True)
+        self.apg_plot.addItem(self.label_apg, ignoreBounds=True)
+        
+        self.proxy_deriv = pg.SignalProxy(self.deriv_time_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouseMoved_deriv)
+        self.deriv_time_widget.scene().sigMouseClicked.connect(self.mouseClicked_deriv)
         
         self.offline_tabs.addTab(self.sub_tab_fft, "Trang 1: Time Domain & Fourier")
         self.offline_tabs.addTab(self.sub_tab_deriv, "Trang 2: Time Domain & Đạo hàm")
@@ -306,12 +382,178 @@ class PPGAnalyzerSuite(QMainWindow):
         self.data_s = np.zeros(self.max_samples)
             
     def on_new_data(self, t, s, p, z):
+        if self.cb_invert_live.isChecked():
+            p = -p
         self.data_p[:-1] = self.data_p[1:]
         self.data_p[-1] = p
         self.data_t[:-1] = self.data_t[1:]
         self.data_t[-1] = t
         self.data_s[:-1] = self.data_s[1:]
         self.data_s[-1] = s
+
+    def mouseMoved_live(self, evt):
+        pos = evt[0]
+        if self.plot_widget.sceneBoundingRect().contains(pos):
+            mousePoint = self.plot_widget.plotItem.vb.mapSceneToView(pos)
+            x, y = mousePoint.x(), mousePoint.y()
+            self.vLine_live.setPos(x)
+            self.label_live.setHtml(f"Mẫu: {int(x)}<br>Biên độ: {y:.2f}")
+            self.label_live.setPos(x, y)
+
+    def mouseMoved_fft_ppg(self, evt):
+        pos = evt[0]
+        if self.fft_ppg_plot.sceneBoundingRect().contains(pos):
+            mousePoint = self.fft_ppg_plot.plotItem.vb.mapSceneToView(pos)
+            x, y = mousePoint.x(), mousePoint.y()
+            self.vLine_fft_ppg.setPos(x)
+            self.label_fft_ppg.setHtml(f"Mẫu: {int(x)}<br>Biên độ: {y:.2f}")
+            self.label_fft_ppg.setPos(x, y)
+
+    def mouseMoved_fft_widget(self, evt):
+        pos = evt[0]
+        if self.fft_widget.sceneBoundingRect().contains(pos):
+            mousePoint = self.fft_widget.plotItem.vb.mapSceneToView(pos)
+            x, y = mousePoint.x(), mousePoint.y()
+            self.vLine_fft.setPos(x)
+            self.label_fft.setHtml(f"Tần số: {x:.2f} Hz<br>Biên độ: {y:.4f}")
+            self.label_fft.setPos(x, y)
+
+    def mouseMoved_deriv(self, evt):
+        pos = evt[0]
+        x = None
+        
+        if self.deriv_ppg_plot.isVisible() and self.deriv_ppg_plot.vb.sceneBoundingRect().contains(pos):
+            mousePoint = self.deriv_ppg_plot.vb.mapSceneToView(pos)
+            x, y = mousePoint.x(), mousePoint.y()
+            self.label_deriv_ppg.setHtml(f"Mẫu: {int(x)}<br>PPG: {y:.2f}")
+            self.label_deriv_ppg.setPos(x, y)
+            self.label_deriv_ppg.show()
+            self.label_vpg.hide()
+            self.label_apg.hide()
+        elif self.vpg_plot.isVisible() and self.vpg_plot.vb.sceneBoundingRect().contains(pos):
+            mousePoint = self.vpg_plot.vb.mapSceneToView(pos)
+            x, y = mousePoint.x(), mousePoint.y()
+            self.label_vpg.setHtml(f"Mẫu: {int(x)}<br>VPG: {y:.2f}")
+            self.label_vpg.setPos(x, y)
+            self.label_vpg.show()
+            self.label_deriv_ppg.hide()
+            self.label_apg.hide()
+        elif self.apg_plot.isVisible() and self.apg_plot.vb.sceneBoundingRect().contains(pos):
+            mousePoint = self.apg_plot.vb.mapSceneToView(pos)
+            x, y = mousePoint.x(), mousePoint.y()
+            self.label_apg.setHtml(f"Mẫu: {int(x)}<br>APG: {y:.2f}")
+            self.label_apg.setPos(x, y)
+            self.label_apg.show()
+            self.label_deriv_ppg.hide()
+            self.label_vpg.hide()
+            
+        if x is not None:
+            self.vLine_deriv_ppg.setPos(x)
+            self.vLine_vpg.setPos(x)
+            self.vLine_apg.setPos(x)
+
+    def toggle_dot_mode(self):
+        self.cb_dot_mode.setChecked(not self.cb_dot_mode.isChecked())
+
+    def mouseClicked_deriv(self, evt):
+        if evt.button() == Qt.MouseButton.LeftButton:
+            pos = evt.scenePos()
+            x = None
+            y = None
+            clicked_plot = None
+            for plot in [self.deriv_ppg_plot, self.vpg_plot, self.apg_plot]:
+                if plot.isVisible() and plot.vb.sceneBoundingRect().contains(pos):
+                    mousePoint = plot.vb.mapSceneToView(pos)
+                    x = mousePoint.x()
+                    y = mousePoint.y()
+                    clicked_plot = plot
+                    break
+            
+            if x is not None:
+                if not hasattr(self, 'temp_rulers'):
+                    self.temp_rulers = []
+                if not hasattr(self, 'redo_rulers'):
+                    self.redo_rulers = []
+                
+                if self.cb_dot_mode.isChecked():
+                    scatter = pg.ScatterPlotItem(x=[x], y=[y], size=10, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255))
+                    clicked_plot.addItem(scatter, ignoreBounds=True)
+                    self.temp_rulers.append(("dot", scatter, clicked_plot))
+                else:
+                    # Thước tạm thời màu Cyan
+                    pen = pg.mkPen('cyan', width=1.5, style=Qt.PenStyle.DashLine)
+                    l1 = pg.InfiniteLine(pos=x, angle=90, pen=pen)
+                    l2 = pg.InfiniteLine(pos=x, angle=90, pen=pen)
+                    l3 = pg.InfiniteLine(pos=x, angle=90, pen=pen)
+                    
+                    self.deriv_ppg_plot.addItem(l1, ignoreBounds=True)
+                    self.vpg_plot.addItem(l2, ignoreBounds=True)
+                    self.apg_plot.addItem(l3, ignoreBounds=True)
+                    
+                    self.temp_rulers.append(("ruler", l1, l2, l3))
+                    
+                self.redo_rulers.clear()
+
+    def undo_temp_ruler(self):
+        if hasattr(self, 'temp_rulers') and len(self.temp_rulers) > 0:
+            if not hasattr(self, 'redo_rulers'):
+                self.redo_rulers = []
+            group = self.temp_rulers.pop()
+            
+            if group[0] == "ruler":
+                _, l1, l2, l3 = group
+                try:
+                    self.deriv_ppg_plot.removeItem(l1)
+                    self.vpg_plot.removeItem(l2)
+                    self.apg_plot.removeItem(l3)
+                except:
+                    pass
+            elif group[0] == "dot":
+                _, scatter, plot = group
+                try:
+                    plot.removeItem(scatter)
+                except:
+                    pass
+                    
+            self.redo_rulers.append(group)
+
+    def redo_temp_ruler(self):
+        if hasattr(self, 'redo_rulers') and len(self.redo_rulers) > 0:
+            if not hasattr(self, 'temp_rulers'):
+                self.temp_rulers = []
+            group = self.redo_rulers.pop()
+            
+            if group[0] == "ruler":
+                _, l1, l2, l3 = group
+                self.deriv_ppg_plot.addItem(l1, ignoreBounds=True)
+                self.vpg_plot.addItem(l2, ignoreBounds=True)
+                self.apg_plot.addItem(l3, ignoreBounds=True)
+            elif group[0] == "dot":
+                _, scatter, plot = group
+                plot.addItem(scatter, ignoreBounds=True)
+                
+            self.temp_rulers.append(group)
+
+    def clear_temp_rulers(self):
+        if hasattr(self, 'temp_rulers'):
+            for group in self.temp_rulers:
+                if group[0] == "ruler":
+                    _, l1, l2, l3 = group
+                    try:
+                        self.deriv_ppg_plot.removeItem(l1)
+                        self.vpg_plot.removeItem(l2)
+                        self.apg_plot.removeItem(l3)
+                    except:
+                        pass
+                elif group[0] == "dot":
+                    _, scatter, plot = group
+                    try:
+                        plot.removeItem(scatter)
+                    except:
+                        pass
+            self.temp_rulers.clear()
+        if hasattr(self, 'redo_rulers'):
+            self.redo_rulers.clear()
 
     def update_plot(self):
         if self.serial_thread.is_running:
@@ -344,19 +586,7 @@ class PPGAnalyzerSuite(QMainWindow):
             self.offline_signal = signal
             self.offline_filename = os.path.basename(file_path)
             
-            # Reset đồ thị
-            self.fft_ppg_plot.clear()
-            self.deriv_ppg_plot.clear()
-            self.vpg_plot.clear()
-            self.apg_plot.clear()
-            self.fft_curve.setData([], []) # Xóa phổ FFT cũ
-            
-            # Chỉ vẽ tín hiệu gốc lên 2 Plot Time Domain
-            self.fft_ppg_plot.plot(self.offline_signal, pen=pg.mkPen('purple', width=1.5))
-            self.fft_ppg_plot.setTitle(f"Tín hiệu PPG Thô - {self.offline_filename} ({len(signal)} mẫu)")
-            
-            self.deriv_ppg_plot.plot(self.offline_signal, pen=pg.mkPen('purple', width=1.5))
-            self.deriv_ppg_plot.setTitle(f"Tín hiệu PPG Thô - {self.offline_filename} ({len(signal)} mẫu)")
+            self.redraw_offline_raw()
             
             self.btn_analyze.setEnabled(True)
             self.btn_analyze.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
@@ -365,6 +595,44 @@ class PPGAnalyzerSuite(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "Lỗi đọc file", str(e))
+
+    def on_invert_changed(self):
+        if self.offline_signal is not None:
+            # Nếu đã tải dữ liệu, vẽ lại raw và tự động chạy phân tích lại
+            self.redraw_offline_raw()
+            self.analyze_data()
+
+    def redraw_offline_raw(self):
+        # Reset đồ thị
+        self.fft_ppg_plot.clear()
+        self.deriv_ppg_plot.clear()
+        self.vpg_plot.clear()
+        self.apg_plot.clear()
+        self.fft_curve.setData([], []) # Xóa phổ FFT cũ
+        
+        if hasattr(self, 'temp_rulers'):
+            self.temp_rulers.clear()
+        if hasattr(self, 'redo_rulers'):
+            self.redo_rulers.clear()
+            
+        signal = -self.offline_signal if self.cb_invert_offline.isChecked() else self.offline_signal
+        
+        # Chỉ vẽ tín hiệu gốc lên 2 Plot Time Domain
+        self.fft_ppg_plot.plot(signal, pen=pg.mkPen('purple', width=1.5))
+        self.fft_ppg_plot.setTitle(f"Tín hiệu PPG Thô - {self.offline_filename} ({len(signal)} mẫu)")
+        self.fft_ppg_plot.addItem(self.vLine_fft_ppg, ignoreBounds=True)
+        self.fft_ppg_plot.addItem(self.label_fft_ppg, ignoreBounds=True)
+        
+        self.deriv_ppg_plot.plot(signal, pen=pg.mkPen('purple', width=1.5))
+        self.deriv_ppg_plot.setTitle(f"Tín hiệu PPG Thô - {self.offline_filename} ({len(signal)} mẫu)")
+        self.deriv_ppg_plot.addItem(self.vLine_deriv_ppg, ignoreBounds=True)
+        self.deriv_ppg_plot.addItem(self.label_deriv_ppg, ignoreBounds=True)
+        
+        self.vpg_plot.addItem(self.vLine_vpg, ignoreBounds=True)
+        self.vpg_plot.addItem(self.label_vpg, ignoreBounds=True)
+        
+        self.apg_plot.addItem(self.vLine_apg, ignoreBounds=True)
+        self.apg_plot.addItem(self.label_apg, ignoreBounds=True)
 
     def toggle_vpg(self, state):
         if state == 2: # Qt.CheckState.Checked = 2 in PyQt6
@@ -387,6 +655,10 @@ class PPGAnalyzerSuite(QMainWindow):
             QMessageBox.warning(self, "Lỗi phân tích", "Dữ liệu quá ngắn (ít hơn 100 mẫu). Không thể tính toán FFT hoặc đạo hàm.")
             return
 
+        # Lật ngược tín hiệu nếu có tick
+        if self.cb_invert_offline.isChecked():
+            signal = -signal
+
         signal_no_dc = signal - np.mean(signal)
         
         # 1. Tính toán VPG và APG
@@ -399,24 +671,48 @@ class PPGAnalyzerSuite(QMainWindow):
         self.vpg_plot.plot(vpg, pen=pg.mkPen('g', width=1.5))
         self.apg_plot.plot(apg, pen=pg.mkPen('orange', width=1.5))
         
-        # 2. Tìm đỉnh trên PPG gốc
-        peaks, _ = find_peaks(signal_no_dc, distance=50, prominence=np.max(signal_no_dc)*0.1)
+        self.vpg_plot.addItem(self.vLine_vpg, ignoreBounds=True)
+        self.vpg_plot.addItem(self.label_vpg, ignoreBounds=True)
+        
+        self.apg_plot.addItem(self.vLine_apg, ignoreBounds=True)
+        self.apg_plot.addItem(self.label_apg, ignoreBounds=True)
+        
+        # Reset lại 2 plot gốc trước khi vẽ đè
+        self.fft_ppg_plot.clear()
+        self.fft_ppg_plot.plot(signal, pen=pg.mkPen('purple', width=1.5))
+        self.fft_ppg_plot.addItem(self.vLine_fft_ppg, ignoreBounds=True)
+        self.fft_ppg_plot.addItem(self.label_fft_ppg, ignoreBounds=True)
+        
+        self.deriv_ppg_plot.clear()
+        self.deriv_ppg_plot.plot(signal, pen=pg.mkPen('purple', width=1.5))
+        self.deriv_ppg_plot.addItem(self.vLine_deriv_ppg, ignoreBounds=True)
+        self.deriv_ppg_plot.addItem(self.label_deriv_ppg, ignoreBounds=True)
+        
+        # 2. Tìm điểm đáy (Valleys / Diastolic feet) trên PPG gốc
+        valleys, _ = find_peaks(-signal_no_dc, distance=50, prominence=np.max(-signal_no_dc)*0.1)
         scatter1 = pg.ScatterPlotItem(
-            x=peaks, y=signal[peaks], 
+            x=valleys, y=signal[valleys], 
             size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255)
         )
         scatter2 = pg.ScatterPlotItem(
-            x=peaks, y=signal[peaks], 
+            x=valleys, y=signal[valleys], 
             size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255)
         )
         # Thêm chấm đỏ vào cả 2 tab
         self.fft_ppg_plot.addItem(scatter1)
         self.deriv_ppg_plot.addItem(scatter2)
         
-        # Tính BPM
+        # Thêm đường dóng (Dashed Vertical Line) từ Đáy xuống đạo hàm
+        for p in valleys:
+            line_pen = pg.mkPen('r', width=1, style=Qt.PenStyle.DashLine)
+            self.deriv_ppg_plot.addItem(pg.InfiniteLine(pos=p, angle=90, pen=line_pen))
+            self.vpg_plot.addItem(pg.InfiniteLine(pos=p, angle=90, pen=line_pen))
+            self.apg_plot.addItem(pg.InfiniteLine(pos=p, angle=90, pen=line_pen))
+        
+        # Tính BPM dựa trên khoảng cách giữa các đáy
         bpm = 0
-        if len(peaks) > 1:
-            intervals = np.diff(peaks) * 0.01 # Fs = 100Hz
+        if len(valleys) > 1:
+            intervals = np.diff(valleys) * 0.01 # Fs = 100Hz
             bpm = 60.0 / np.mean(intervals)
         
         title_str = f"Tín hiệu PPG Thô - {self.offline_filename} | Nhịp tim: {bpm:.1f} BPM"
