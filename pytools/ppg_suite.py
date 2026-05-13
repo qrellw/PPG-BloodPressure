@@ -15,7 +15,7 @@ import pyqtgraph as pg
 import pyqtgraph.exporters
 import pandas as pd
 import scipy.fftpack
-from scipy.signal import find_peaks, butter, firwin, freqz, filtfilt, sosfreqz, sosfiltfilt
+from scipy.signal import find_peaks, butter, firwin, freqz, filtfilt, sosfreqz, sosfiltfilt, savgol_filter
 from scipy.ndimage import median_filter
 
 # --- SERIAL THREAD ---
@@ -109,6 +109,12 @@ class PPGAnalyzerSuite(QMainWindow):
         # Filter coefficients
         self.filter_b = None
         self.filter_a = None
+        
+        # Pipeline State
+        self.filter_pipeline = []
+        self.current_filter_idx = -1
+        self._is_populating = False
+        self.pure_offline_signal = None
         
         self.init_ui()
         
@@ -503,10 +509,7 @@ class PPGAnalyzerSuite(QMainWindow):
         control_layout.addWidget(self.cb_auto_preview)
         control_layout.addWidget(self.cb_show_response)
         
-        self.btn_design = QPushButton("1. Thiết kế & Xem đáp ứng")
-        self.btn_design.clicked.connect(self.design_filter)
-        
-        self.btn_apply_filter = QPushButton("2. Áp dụng Lọc lên dữ liệu")
+        self.btn_apply_filter = QPushButton("Áp dụng Lọc & Xem đáp ứng")
         self.btn_apply_filter.clicked.connect(self.apply_filter)
         self.btn_apply_filter.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
         
@@ -518,21 +521,8 @@ class PPGAnalyzerSuite(QMainWindow):
         self.btn_export_csv.clicked.connect(self.export_filtered_csv)
         export_layout.addWidget(self.btn_export_c)
         export_layout.addWidget(self.btn_export_csv)
-        control_layout.addWidget(self.btn_design)
+        
         control_layout.addWidget(self.btn_apply_filter)
-        
-        group_chain = QGroupBox("Cộng dồn Bộ lọc (Chaining)")
-        chain_layout = QVBoxLayout(group_chain)
-        self.btn_bake_filter = QPushButton("Ghi đè làm Tín hiệu Gốc (Bake)")
-        self.btn_bake_filter.clicked.connect(self.bake_filter)
-        self.btn_bake_filter.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        self.btn_restore_original = QPushButton("Khôi phục Tín hiệu Ban đầu")
-        self.btn_restore_original.clicked.connect(self.restore_original_signal)
-        self.btn_restore_original.setStyleSheet("background-color: #F44336; color: white; font-weight: bold;")
-        chain_layout.addWidget(self.btn_bake_filter)
-        chain_layout.addWidget(self.btn_restore_original)
-        
-        control_layout.addWidget(group_chain)
         control_layout.addWidget(group_export)
         control_layout.addStretch()
         
@@ -541,8 +531,7 @@ class PPGAnalyzerSuite(QMainWindow):
                        self.spin_cutoff2, self.spin_hampel_window, self.spin_hampel_sigma, 
                        self.spin_kalman_r, self.spin_kalman_q, self.spin_sg_window, self.spin_sg_poly]:
             if isinstance(widget, QComboBox):
-                # We can't attach valueChanged to combobox
-                pass
+                widget.currentIndexChanged.connect(self.on_param_changed)
             elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
                 widget.valueChanged.connect(self.on_param_changed)
                 
@@ -613,7 +602,21 @@ class PPGAnalyzerSuite(QMainWindow):
         }
 
     def add_pipeline_filter(self):
-        layer = self.create_default_filter_layer()
+        layer = {
+            'impl': self.cb_filter_impl.currentText(),
+            'type': self.cb_filter_type.currentText(),
+            'order': self.spin_order.value(),
+            'cutoff1': self.spin_cutoff1.value(),
+            'cutoff2': self.spin_cutoff2.value(),
+            'hampel_window': self.spin_hampel_window.value(),
+            'hampel_sigma': self.spin_hampel_sigma.value(),
+            'kalman_r': self.spin_kalman_r.value(),
+            'kalman_q': self.spin_kalman_q.value(),
+            'sg_window': self.spin_sg_window.value(),
+            'sg_poly': self.spin_sg_poly.value(),
+            'is_active': True,
+            'b': None, 'a': None, 'sos': None
+        }
         self.filter_pipeline.append(layer)
         self.update_pipeline_list()
         self.list_pipeline.setCurrentRow(len(self.filter_pipeline) - 1)
@@ -659,6 +662,10 @@ class PPGAnalyzerSuite(QMainWindow):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if layer['is_active'] else Qt.CheckState.Unchecked)
             self.list_pipeline.addItem(item)
+            
+        if 0 <= self.current_filter_idx < len(self.filter_pipeline):
+            self.list_pipeline.setCurrentRow(self.current_filter_idx)
+            
         self.list_pipeline.blockSignals(False)
 
     def on_pipeline_selection_changed(self, idx):
@@ -695,7 +702,7 @@ class PPGAnalyzerSuite(QMainWindow):
         self.on_filter_impl_changed()
 
     def update_layer_from_ui(self):
-        if self.current_filter_idx >= 0 and not getattr(self, '_is_populating', False):
+        if 0 <= self.current_filter_idx < len(self.filter_pipeline):
             layer = self.filter_pipeline[self.current_filter_idx]
             layer['impl'] = self.cb_filter_impl.currentText()
             layer['type'] = self.cb_filter_type.currentText()
@@ -763,10 +770,6 @@ class PPGAnalyzerSuite(QMainWindow):
         else:
             self.freq_plot.setTitle("Đáp ứng Biên độ (Magnitude)")
             self.phase_plot.setTitle("Đáp ứng Pha (Phase)")
-            
-        if self.cb_auto_preview.isChecked():
-            self.design_filter(silent=True)
-            self.apply_filter(silent=True)
 
     def on_filter_type_changed(self, *args):
         f_type = self.cb_filter_type.currentText()
@@ -787,6 +790,7 @@ class PPGAnalyzerSuite(QMainWindow):
         self.freq_splitter.setVisible(is_visible)
 
     def on_param_changed(self, *args):
+        if getattr(self, '_is_populating', False): return
         self.update_layer_from_ui()
         if self.cb_auto_preview.isChecked():
             self.apply_filter(silent=True)
@@ -1243,6 +1247,14 @@ class PPGAnalyzerSuite(QMainWindow):
             
             self.btn_analyze.setEnabled(True)
             self.btn_analyze.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+            
+            # Tự động áp dụng Pipeline (nếu có) lên file mới
+            if len(self.filter_pipeline) > 0 and self.cb_auto_preview.isChecked():
+                self.apply_filter(silent=True)
+            else:
+                # Nếu không có pipeline, chỉ cần update đồ thị gốc ở tab filter
+                self.orig_curve.setData(-self.pure_offline_signal if self.cb_filter_invert.isChecked() else self.pure_offline_signal)
+                self.filt_curve.setData([])
             
             QMessageBox.information(self, "Đã tải file", "Đã tải dữ liệu thành công. Nhấn 'Bắt đầu Phân tích' để xem FFT và Đạo hàm.")
             

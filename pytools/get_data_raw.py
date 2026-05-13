@@ -49,7 +49,7 @@ try:
     print(f"\n Đang thu thập {TARGET_SAMPLES} mẫu dữ liệu thô (RAW)...")
     print(f" File lưu tại: {save_path}\n")
 
-    with open(save_path, mode='w', newline='') as f:
+    with open(save_path, mode='w', newline='') as f: 
         writer = csv.writer(f)
         writer.writerow(["Raw_IR"]) # Chỉ ghi 1 cột duy nhất
         
