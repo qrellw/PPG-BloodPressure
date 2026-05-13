@@ -34,8 +34,8 @@ if not port:
     print(" Lỗi: Không tìm thấy chip CH340")
     exit()
 
-# Thiết lập số lượng mẫu cần thu (3000 mẫu ở 100Hz = 30 giây)
-TARGET_SAMPLES = 3000
+# Thiết lập số lượng mẫu cần thu (9000 mẫu ở 100Hz = 90 giây)
+TARGET_SAMPLES = 9000
 sample_count = 0
 
 try:
@@ -81,7 +81,7 @@ try:
 except Exception as e:
     print(f"\n Lỗi: {e}")
 finally:
-    # Đoạn này sẽ chạy ngay khi thu đủ 3000 mẫu
+    # Đoạn này sẽ chạy ngay khi thu đủ 9000 mẫu
     print("\n\n Thu thập hoàn tất! File đã được đóng an toàn.")
     if 'ser' in locals() and ser.is_open:
         ser.close()

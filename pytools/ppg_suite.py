@@ -7,14 +7,16 @@ from datetime import datetime
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QComboBox, QLabel, QTabWidget, 
-                             QFileDialog, QMessageBox, QSplitter, QSpinBox, QCheckBox)
+                             QFileDialog, QMessageBox, QSplitter, QSpinBox, QCheckBox,
+                             QListWidget, QListWidgetItem)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt6.QtGui import QShortcut, QKeySequence
 import pyqtgraph as pg
 import pyqtgraph.exporters
 import pandas as pd
 import scipy.fftpack
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, butter, firwin, freqz, filtfilt, sosfreqz, sosfiltfilt
+from scipy.ndimage import median_filter
 
 # --- SERIAL THREAD ---
 class SerialThread(QThread):
@@ -104,6 +106,10 @@ class PPGAnalyzerSuite(QMainWindow):
         self.offline_signal = None
         self.offline_filename = ""
         
+        # Filter coefficients
+        self.filter_b = None
+        self.filter_a = None
+        
         self.init_ui()
         
     def init_ui(self):
@@ -117,11 +123,14 @@ class PPGAnalyzerSuite(QMainWindow):
         
         self.tab_live = QWidget()
         self.tab_offline = QWidget()
+        self.tab_filter = QWidget()
         self.tabs.addTab(self.tab_live, "1. Live Plotting")
         self.tabs.addTab(self.tab_offline, "2. Offline Analysis")
+        self.tabs.addTab(self.tab_filter, "3. Phát triển Bộ lọc (Filter)")
         
         self.setup_live_tab()
         self.setup_offline_tab()
+        self.setup_filter_tab()
         
         # Phím tắt Hoàn tác / Làm lại cho thước tạm
         self.shortcut_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
@@ -350,6 +359,649 @@ class PPGAnalyzerSuite(QMainWindow):
         self.offline_tabs.addTab(self.sub_tab_deriv, "Trang 2: Time Domain & Đạo hàm")
         
         layout.addWidget(self.offline_tabs)
+
+    def setup_filter_tab(self):
+        from PyQt6.QtWidgets import QDoubleSpinBox, QFormLayout, QGroupBox, QGridLayout, QInputDialog, QTextEdit, QDialog
+        layout = QHBoxLayout(self.tab_filter)
+        
+        # Panel Điều khiển (Trái)
+        control_panel = QWidget()
+        control_layout = QVBoxLayout(control_panel)
+        control_panel.setFixedWidth(300)
+        
+        group_pipeline = QGroupBox("Danh sách Bộ lọc (Pipeline)")
+        pipe_layout = QVBoxLayout(group_pipeline)
+        
+        self.list_pipeline = QListWidget()
+        self.list_pipeline.currentRowChanged.connect(self.on_pipeline_selection_changed)
+        self.list_pipeline.itemChanged.connect(self.on_pipeline_item_changed)
+        
+        btn_pipe_layout = QHBoxLayout()
+        self.btn_add_filter = QPushButton("+ Thêm")
+        self.btn_add_filter.clicked.connect(self.add_pipeline_filter)
+        self.btn_remove_filter = QPushButton("- Xóa")
+        self.btn_remove_filter.clicked.connect(self.remove_pipeline_filter)
+        self.btn_up_filter = QPushButton("▲ Lên")
+        self.btn_up_filter.clicked.connect(self.move_pipeline_filter_up)
+        self.btn_down_filter = QPushButton("▼ Xuống")
+        self.btn_down_filter.clicked.connect(self.move_pipeline_filter_down)
+        
+        btn_pipe_layout.addWidget(self.btn_add_filter)
+        btn_pipe_layout.addWidget(self.btn_remove_filter)
+        btn_pipe_layout.addWidget(self.btn_up_filter)
+        btn_pipe_layout.addWidget(self.btn_down_filter)
+        
+        pipe_layout.addWidget(self.list_pipeline)
+        pipe_layout.addLayout(btn_pipe_layout)
+        control_layout.addWidget(group_pipeline)
+        
+        group_design = QGroupBox("Thông số Bộ lọc đang chọn")
+        form_layout = QFormLayout(group_design)
+        
+        self.cb_filter_impl = QComboBox()
+        self.cb_filter_impl.addItems(["IIR (Butterworth)", "FIR", "Kalman (1D)", "Hampel", "Savitzky-Golay"])
+        self.cb_filter_impl.currentIndexChanged.connect(self.on_filter_impl_changed)
+        
+        self.cb_filter_type = QComboBox()
+        self.cb_filter_type.addItems(["Lowpass", "Highpass", "Bandpass", "Bandstop"])
+        self.cb_filter_type.currentIndexChanged.connect(self.on_filter_type_changed)
+        
+        # UI for FIR/IIR
+        self.spin_order = QSpinBox()
+        self.spin_order.setRange(1, 1000)
+        self.spin_order.setValue(4)
+        
+        self.spin_cutoff1 = QDoubleSpinBox()
+        self.spin_cutoff1.setRange(0.01, 50.0) # max Fs/2 = 50Hz
+        self.spin_cutoff1.setValue(5.0)
+        self.spin_cutoff1.setDecimals(2)
+        self.spin_cutoff1.setSuffix(" Hz")
+        
+        self.spin_cutoff2 = QDoubleSpinBox()
+        self.spin_cutoff2.setRange(0.01, 50.0)
+        self.spin_cutoff2.setValue(10.0)
+        self.spin_cutoff2.setDecimals(2)
+        self.spin_cutoff2.setSuffix(" Hz")
+        self.spin_cutoff2.hide()
+        self.label_cutoff2 = QLabel("Tần số cắt 2:")
+        self.label_cutoff2.hide()
+        
+        # UI for Hampel
+        self.spin_hampel_window = QSpinBox()
+        self.spin_hampel_window.setRange(3, 1000)
+        self.spin_hampel_window.setValue(10)
+        self.spin_hampel_window.hide()
+        self.label_hampel_window = QLabel("Window Size:")
+        self.label_hampel_window.hide()
+        
+        self.spin_hampel_sigma = QDoubleSpinBox()
+        self.spin_hampel_sigma.setRange(0.1, 10.0)
+        self.spin_hampel_sigma.setValue(3.0)
+        self.spin_hampel_sigma.setDecimals(1)
+        self.spin_hampel_sigma.hide()
+        self.label_hampel_sigma = QLabel("Sigma:")
+        self.label_hampel_sigma.hide()
+        
+        # UI for Kalman
+        self.spin_kalman_r = QDoubleSpinBox()
+        self.spin_kalman_r.setRange(0.0001, 1000.0)
+        self.spin_kalman_r.setValue(1.0)
+        self.spin_kalman_r.setDecimals(4)
+        self.spin_kalman_r.hide()
+        self.label_kalman_r = QLabel("R (Meas Noise):")
+        self.label_kalman_r.hide()
+        
+        self.spin_kalman_q = QDoubleSpinBox()
+        self.spin_kalman_q.setRange(0.000001, 10.0)
+        self.spin_kalman_q.setValue(1e-4)
+        self.spin_kalman_q.setDecimals(6)
+        self.spin_kalman_q.hide()
+        self.label_kalman_q = QLabel("Q (Proc Noise):")
+        self.label_kalman_q.hide()
+        
+        form_layout.addRow("Phương pháp:", self.cb_filter_impl)
+        self.label_f_type = QLabel("Dạng lọc:")
+        form_layout.addRow(self.label_f_type, self.cb_filter_type)
+        self.label_order = QLabel("Bậc / Taps:")
+        form_layout.addRow(self.label_order, self.spin_order)
+        self.label_cutoff1 = QLabel("Tần số cắt 1:")
+        form_layout.addRow(self.label_cutoff1, self.spin_cutoff1)
+        form_layout.addRow(self.label_cutoff2, self.spin_cutoff2)
+        
+        form_layout.addRow(self.label_hampel_window, self.spin_hampel_window)
+        form_layout.addRow(self.label_hampel_sigma, self.spin_hampel_sigma)
+        
+        form_layout.addRow(self.label_kalman_r, self.spin_kalman_r)
+        form_layout.addRow(self.label_kalman_q, self.spin_kalman_q)
+        
+        self.spin_sg_window = QSpinBox()
+        self.spin_sg_window.setRange(3, 999)
+        self.spin_sg_window.setSingleStep(2)
+        self.spin_sg_window.setValue(11)
+        self.spin_sg_window.hide()
+        self.label_sg_window = QLabel("Window Length:")
+        self.label_sg_window.hide()
+        
+        self.spin_sg_poly = QSpinBox()
+        self.spin_sg_poly.setRange(1, 10)
+        self.spin_sg_poly.setValue(3)
+        self.spin_sg_poly.hide()
+        self.label_sg_poly = QLabel("Poly Order:")
+        self.label_sg_poly.hide()
+        
+        form_layout.addRow(self.label_sg_window, self.spin_sg_window)
+        form_layout.addRow(self.label_sg_poly, self.spin_sg_poly)
+        
+        # Auto Preview
+        self.cb_filter_invert = QCheckBox("Lật ngược tín hiệu (Invert)")
+        self.cb_auto_preview = QCheckBox("Tự động xem trước (Auto-Preview)")
+        self.cb_auto_preview.setChecked(True)
+        self.cb_show_response = QCheckBox("Hiển thị Đồ thị Đáp ứng (Freq/Phase)")
+        self.cb_show_response.setChecked(True)
+        control_layout.addWidget(group_design)
+        control_layout.addWidget(self.cb_filter_invert)
+        control_layout.addWidget(self.cb_auto_preview)
+        control_layout.addWidget(self.cb_show_response)
+        
+        self.btn_design = QPushButton("1. Thiết kế & Xem đáp ứng")
+        self.btn_design.clicked.connect(self.design_filter)
+        
+        self.btn_apply_filter = QPushButton("2. Áp dụng Lọc lên dữ liệu")
+        self.btn_apply_filter.clicked.connect(self.apply_filter)
+        self.btn_apply_filter.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        
+        group_export = QGroupBox("Xuất kết quả")
+        export_layout = QVBoxLayout(group_export)
+        self.btn_export_c = QPushButton("Xuất Code C/C++ (Hệ số)")
+        self.btn_export_c.clicked.connect(self.export_c_code)
+        self.btn_export_csv = QPushButton("Xuất dữ liệu sau lọc (CSV)")
+        self.btn_export_csv.clicked.connect(self.export_filtered_csv)
+        export_layout.addWidget(self.btn_export_c)
+        export_layout.addWidget(self.btn_export_csv)
+        control_layout.addWidget(self.btn_design)
+        control_layout.addWidget(self.btn_apply_filter)
+        
+        group_chain = QGroupBox("Cộng dồn Bộ lọc (Chaining)")
+        chain_layout = QVBoxLayout(group_chain)
+        self.btn_bake_filter = QPushButton("Ghi đè làm Tín hiệu Gốc (Bake)")
+        self.btn_bake_filter.clicked.connect(self.bake_filter)
+        self.btn_bake_filter.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self.btn_restore_original = QPushButton("Khôi phục Tín hiệu Ban đầu")
+        self.btn_restore_original.clicked.connect(self.restore_original_signal)
+        self.btn_restore_original.setStyleSheet("background-color: #F44336; color: white; font-weight: bold;")
+        chain_layout.addWidget(self.btn_bake_filter)
+        chain_layout.addWidget(self.btn_restore_original)
+        
+        control_layout.addWidget(group_chain)
+        control_layout.addWidget(group_export)
+        control_layout.addStretch()
+        
+        # Connect signals for auto-preview
+        for widget in [self.cb_filter_impl, self.cb_filter_type, self.spin_order, self.spin_cutoff1, 
+                       self.spin_cutoff2, self.spin_hampel_window, self.spin_hampel_sigma, 
+                       self.spin_kalman_r, self.spin_kalman_q, self.spin_sg_window, self.spin_sg_poly]:
+            if isinstance(widget, QComboBox):
+                # We can't attach valueChanged to combobox
+                pass
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                widget.valueChanged.connect(self.on_param_changed)
+                
+        self.cb_auto_preview.stateChanged.connect(self.on_param_changed)
+        self.cb_filter_invert.stateChanged.connect(self.on_param_changed)
+        self.cb_show_response.stateChanged.connect(self.on_show_response_changed)
+        
+        # Khu vực đồ thị (Phải)
+        plots_splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        self.freq_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        self.freq_plot = pg.PlotWidget(title="Đáp ứng Biên độ (Magnitude)")
+        self.freq_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.freq_plot.setLabel('bottom', "Tần số (Hz)")
+        self.freq_plot.setLabel('left', "Biên độ (dB)")
+        self.freq_curve = self.freq_plot.plot([], [], pen=pg.mkPen('b', width=2))
+        
+        self.phase_plot = pg.PlotWidget(title="Đáp ứng Pha (Phase)")
+        self.phase_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.phase_plot.setLabel('bottom', "Tần số (Hz)")
+        self.phase_plot.setLabel('left', "Pha (Radians)")
+        self.phase_curve = self.phase_plot.plot([], [], pen=pg.mkPen('r', width=2))
+        
+        self.freq_splitter.addWidget(self.freq_plot)
+        self.freq_splitter.addWidget(self.phase_plot)
+        
+        time_splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        self.orig_time_plot = pg.PlotWidget(title="Tín hiệu Gốc (Chưa lọc)")
+        self.orig_time_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.orig_time_plot.setLabel('left', "Biên độ")
+        self.orig_curve = self.orig_time_plot.plot([], [], pen=pg.mkPen((150, 150, 150), width=1.5))
+        
+        self.filt_time_plot = pg.PlotWidget(title="Tín hiệu Đã lọc")
+        self.filt_time_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.filt_time_plot.setLabel('bottom', "Mẫu (Samples)")
+        self.filt_time_plot.setLabel('left', "Biên độ")
+        self.filt_time_plot.setXLink(self.orig_time_plot)
+        self.filt_curve = self.filt_time_plot.plot([], [], pen=pg.mkPen('purple', width=1.5))
+        
+        time_splitter.addWidget(self.orig_time_plot)
+        time_splitter.addWidget(self.filt_time_plot)
+        
+        plots_splitter.addWidget(self.freq_splitter)
+        plots_splitter.addWidget(time_splitter)
+        plots_splitter.setSizes([300, 400])
+        
+        layout.addWidget(control_panel)
+        layout.addWidget(plots_splitter)
+
+    
+    def create_default_filter_layer(self, impl="IIR (Butterworth)"):
+        return {
+            'impl': impl,
+            'type': "Lowpass",
+            'order': 4 if "IIR" in impl else 101,
+            'cutoff1': 5.0,
+            'cutoff2': 10.0,
+            'hampel_window': 10,
+            'hampel_sigma': 3.0,
+            'kalman_r': 1.0,
+            'kalman_q': 1e-4,
+            'sg_window': 11,
+            'sg_poly': 3,
+            'is_active': True,
+            'b': None, 'a': None, 'sos': None
+        }
+
+    def add_pipeline_filter(self):
+        layer = self.create_default_filter_layer()
+        self.filter_pipeline.append(layer)
+        self.update_pipeline_list()
+        self.list_pipeline.setCurrentRow(len(self.filter_pipeline) - 1)
+        if self.cb_auto_preview.isChecked():
+            self.apply_filter(silent=True)
+            
+    def remove_pipeline_filter(self):
+        idx = self.list_pipeline.currentRow()
+        if 0 <= idx < len(self.filter_pipeline):
+            self.filter_pipeline.pop(idx)
+            self.update_pipeline_list()
+            self.list_pipeline.setCurrentRow(max(0, idx - 1))
+            if self.cb_auto_preview.isChecked():
+                self.apply_filter(silent=True)
+
+    def move_pipeline_filter_up(self):
+        idx = self.list_pipeline.currentRow()
+        if idx > 0:
+            self.filter_pipeline[idx], self.filter_pipeline[idx-1] = self.filter_pipeline[idx-1], self.filter_pipeline[idx]
+            self.update_pipeline_list()
+            self.list_pipeline.setCurrentRow(idx - 1)
+            if self.cb_auto_preview.isChecked():
+                self.apply_filter(silent=True)
+
+    def move_pipeline_filter_down(self):
+        idx = self.list_pipeline.currentRow()
+        if 0 <= idx < len(self.filter_pipeline) - 1:
+            self.filter_pipeline[idx], self.filter_pipeline[idx+1] = self.filter_pipeline[idx+1], self.filter_pipeline[idx]
+            self.update_pipeline_list()
+            self.list_pipeline.setCurrentRow(idx + 1)
+            if self.cb_auto_preview.isChecked():
+                self.apply_filter(silent=True)
+
+    def update_pipeline_list(self):
+        self.list_pipeline.blockSignals(True)
+        self.list_pipeline.clear()
+        for i, layer in enumerate(self.filter_pipeline):
+            status = "[v]" if layer['is_active'] else "[ ]"
+            name = f"{status} {layer['impl']} - {layer['type']}"
+            if layer['impl'] in ["Hampel", "Kalman (1D)", "Savitzky-Golay"]:
+                name = f"{status} {layer['impl']}"
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if layer['is_active'] else Qt.CheckState.Unchecked)
+            self.list_pipeline.addItem(item)
+        self.list_pipeline.blockSignals(False)
+
+    def on_pipeline_selection_changed(self, idx):
+        if 0 <= idx < len(self.filter_pipeline):
+            self.current_filter_idx = idx
+            self.populate_ui_from_layer(self.filter_pipeline[idx])
+        else:
+            self.current_filter_idx = -1
+
+    def on_pipeline_item_changed(self, item):
+        idx = self.list_pipeline.row(item)
+        if 0 <= idx < len(self.filter_pipeline):
+            is_checked = item.checkState() == Qt.CheckState.Checked
+            if self.filter_pipeline[idx]['is_active'] != is_checked:
+                self.filter_pipeline[idx]['is_active'] = is_checked
+                self.update_pipeline_list()
+                if self.cb_auto_preview.isChecked():
+                    self.apply_filter(silent=True)
+
+    def populate_ui_from_layer(self, layer):
+        self._is_populating = True
+        self.cb_filter_impl.setCurrentText(layer['impl'])
+        self.cb_filter_type.setCurrentText(layer['type'])
+        self.spin_order.setValue(layer['order'])
+        self.spin_cutoff1.setValue(layer['cutoff1'])
+        self.spin_cutoff2.setValue(layer['cutoff2'])
+        self.spin_hampel_window.setValue(layer['hampel_window'])
+        self.spin_hampel_sigma.setValue(layer['hampel_sigma'])
+        self.spin_kalman_r.setValue(layer['kalman_r'])
+        self.spin_kalman_q.setValue(layer['kalman_q'])
+        self.spin_sg_window.setValue(layer['sg_window'])
+        self.spin_sg_poly.setValue(layer['sg_poly'])
+        self._is_populating = False
+        self.on_filter_impl_changed()
+
+    def update_layer_from_ui(self):
+        if self.current_filter_idx >= 0 and not getattr(self, '_is_populating', False):
+            layer = self.filter_pipeline[self.current_filter_idx]
+            layer['impl'] = self.cb_filter_impl.currentText()
+            layer['type'] = self.cb_filter_type.currentText()
+            layer['order'] = self.spin_order.value()
+            layer['cutoff1'] = self.spin_cutoff1.value()
+            layer['cutoff2'] = self.spin_cutoff2.value()
+            layer['hampel_window'] = self.spin_hampel_window.value()
+            layer['hampel_sigma'] = self.spin_hampel_sigma.value()
+            layer['kalman_r'] = self.spin_kalman_r.value()
+            layer['kalman_q'] = self.spin_kalman_q.value()
+            layer['sg_window'] = self.spin_sg_window.value()
+            layer['sg_poly'] = self.spin_sg_poly.value()
+            self.update_pipeline_list()
+
+    def on_filter_impl_changed(self, *args):
+        impl = self.cb_filter_impl.currentText()
+        is_iir_fir = "IIR" in impl or "FIR" in impl
+        is_hampel = "Hampel" in impl
+        is_kalman = "Kalman" in impl
+        is_sg = "Savitzky" in impl
+        
+        self.cb_filter_type.setVisible(is_iir_fir)
+        self.label_f_type.setVisible(is_iir_fir)
+        self.spin_order.setVisible(is_iir_fir)
+        self.label_order.setVisible(is_iir_fir)
+        self.spin_cutoff1.setVisible(is_iir_fir)
+        self.label_cutoff1.setVisible(is_iir_fir)
+        
+        if "IIR" in impl and self.spin_order.value() > 10:
+            self.spin_order.blockSignals(True)
+            self.spin_order.setValue(4)
+            self.spin_order.blockSignals(False)
+        elif "FIR" in impl and self.spin_order.value() <= 10:
+            self.spin_order.blockSignals(True)
+            self.spin_order.setValue(101)
+            self.spin_order.blockSignals(False)
+        
+        if is_iir_fir and self.cb_filter_type.currentText() in ["Bandpass", "Bandstop"]:
+            self.spin_cutoff2.show()
+            self.label_cutoff2.show()
+        else:
+            self.spin_cutoff2.hide()
+            self.label_cutoff2.hide()
+            
+        self.spin_hampel_window.setVisible(is_hampel)
+        self.label_hampel_window.setVisible(is_hampel)
+        self.spin_hampel_sigma.setVisible(is_hampel)
+        self.label_hampel_sigma.setVisible(is_hampel)
+        
+        self.spin_kalman_r.setVisible(is_kalman)
+        self.label_kalman_r.setVisible(is_kalman)
+        self.spin_kalman_q.setVisible(is_kalman)
+        self.label_kalman_q.setVisible(is_kalman)
+        
+        self.spin_sg_window.setVisible(is_sg)
+        self.label_sg_window.setVisible(is_sg)
+        self.spin_sg_poly.setVisible(is_sg)
+        self.label_sg_poly.setVisible(is_sg)
+        
+        if not is_iir_fir:
+            self.freq_plot.setTitle(f"Đáp ứng Biên độ (Không áp dụng cho {impl})")
+            self.phase_plot.setTitle(f"Đáp ứng Pha (Không áp dụng cho {impl})")
+            self.freq_curve.setData([], [])
+            self.phase_curve.setData([], [])
+        else:
+            self.freq_plot.setTitle("Đáp ứng Biên độ (Magnitude)")
+            self.phase_plot.setTitle("Đáp ứng Pha (Phase)")
+            
+        if self.cb_auto_preview.isChecked():
+            self.design_filter(silent=True)
+            self.apply_filter(silent=True)
+
+    def on_filter_type_changed(self, *args):
+        f_type = self.cb_filter_type.currentText()
+        if f_type in ["Bandpass", "Bandstop"] and ("IIR" in self.cb_filter_impl.currentText() or "FIR" in self.cb_filter_impl.currentText()):
+            self.label_cutoff2.show()
+            self.spin_cutoff2.show()
+        else:
+            self.label_cutoff2.hide()
+            self.spin_cutoff2.hide()
+            
+        if self.cb_auto_preview.isChecked():
+            self.design_filter(silent=True)
+            self.apply_filter(silent=True)
+            
+    
+    def on_show_response_changed(self, state):
+        is_visible = self.cb_show_response.isChecked()
+        self.freq_splitter.setVisible(is_visible)
+
+    def on_param_changed(self, *args):
+        self.update_layer_from_ui()
+        if self.cb_auto_preview.isChecked():
+            self.apply_filter(silent=True)
+
+    def design_filter(self, *args, silent=False):
+        # Hàm này chỉ gọi apply_filter vì apply_filter giờ đã bao trọn việc vẽ Response
+        self.apply_filter(silent=silent)
+
+    def apply_filter(self, *args, silent=False):
+        if isinstance(silent, bool) == False: silent = False
+        
+        if self.pure_offline_signal is None:
+            if not silent: QMessageBox.warning(self, "Lỗi", "Chưa có dữ liệu. Vui lòng tải file CSV ở Tab Offline Analysis trước.")
+            return
+            
+        signal = -self.pure_offline_signal if self.cb_filter_invert.isChecked() else self.pure_offline_signal
+        
+        # 1. Tính toán Frequency / Phase Response
+        if self.cb_show_response.isChecked():
+            fs = 100.0
+            total_h = np.ones(8000, dtype=complex)
+            w_axis = None
+            has_freq_response = False
+            
+            for layer in self.filter_pipeline:
+                if not layer.get('is_active', True): continue
+                impl = layer['impl']
+                f_type = layer['type']
+                order = layer['order']
+                cut1 = layer['cutoff1']
+                cut2 = layer['cutoff2']
+                
+                if "IIR" in impl or "FIR" in impl:
+                    nyq = 0.5 * fs
+                    if f_type in ["Bandpass", "Bandstop"]:
+                        if cut1 >= cut2:
+                            continue
+                        Wn = [cut1 / nyq, cut2 / nyq]
+                    else:
+                        Wn = cut1 / nyq
+                        
+                    if "IIR" in impl:
+                        try:
+                            layer['sos'] = butter(order, Wn, btype=f_type.lower(), output='sos')
+                            w, h = sosfreqz(layer['sos'], worN=8000)
+                            total_h *= h
+                            w_axis = w
+                            has_freq_response = True
+                        except Exception:
+                            pass
+                    else: # FIR
+                        try:
+                            numtaps = order
+                            if f_type.lower() in ['highpass', 'bandstop'] and numtaps % 2 == 0:
+                                numtaps += 1
+                            if f_type in ["Bandpass", "Bandstop"]:
+                                cutoff = [cut1, cut2]
+                            else:
+                                cutoff = cut1
+                            pass_zero = True
+                            if f_type == "Highpass": pass_zero = False
+                            elif f_type == "Bandpass": pass_zero = False
+                            
+                            b = firwin(numtaps, cutoff, pass_zero=pass_zero, fs=fs)
+                            a = [1.0]
+                            layer['b'] = b
+                            layer['a'] = a
+                            w, h = freqz(b, a, worN=8000)
+                            total_h *= h
+                            w_axis = w
+                            has_freq_response = True
+                        except Exception:
+                            pass
+                            
+            if has_freq_response and w_axis is not None:
+                f_hz = (w_axis * fs) / (2 * np.pi)
+                mag_db = 20 * np.log10(np.maximum(np.abs(total_h), 1e-5))
+                phase_rad = np.unwrap(np.angle(total_h))
+                self.freq_curve.setData(f_hz, mag_db)
+                self.phase_curve.setData(f_hz, phase_rad)
+            else:
+                self.freq_curve.setData([], [])
+                self.phase_curve.setData([], [])
+
+        # 2. Xử lý tín hiệu qua Pipeline
+        filtered_signal = np.copy(signal)
+        try:
+            for layer in self.filter_pipeline:
+                if not layer.get('is_active', True): continue
+                impl = layer['impl']
+                
+                if "IIR" in impl:
+                    if layer.get('sos') is not None:
+                        padlen = min(3 * 2 * len(layer['sos']), len(filtered_signal) - 2)
+                        if padlen < 0: padlen = 0
+                        filtered_signal = sosfiltfilt(layer['sos'], filtered_signal, padlen=padlen)
+                elif "FIR" in impl:
+                    if layer.get('b') is not None:
+                        try:
+                            filtered_signal = filtfilt(layer['b'], layer['a'], filtered_signal)
+                        except ValueError:
+                            padlen = max(0, len(filtered_signal) - 2)
+                            if padlen > 0:
+                                filtered_signal = filtfilt(layer['b'], layer['a'], filtered_signal, padlen=padlen)
+                elif "Hampel" in impl:
+                    window_size = layer['hampel_window']
+                    n_sigmas = layer['hampel_sigma']
+                    rolling_median = median_filter(filtered_signal, size=window_size)
+                    diff = np.abs(filtered_signal - rolling_median)
+                    rolling_mad = median_filter(diff, size=window_size)
+                    outliers = diff > (n_sigmas * rolling_mad)
+                    filtered_signal = np.where(outliers, rolling_median, filtered_signal)
+                elif "Kalman" in impl:
+                    R = layer['kalman_r']
+                    Q = layer['kalman_q']
+                    n = len(filtered_signal)
+                    temp_sig = np.zeros(n)
+                    x_est = filtered_signal[0]
+                    P_est = 1.0
+                    for i in range(n):
+                        x_pred = x_est
+                        P_pred = P_est + Q
+                        K = P_pred / (P_pred + R)
+                        x_est = x_pred + K * (filtered_signal[i] - x_pred)
+                        P_est = (1 - K) * P_pred
+                        temp_sig[i] = x_est
+                    filtered_signal = temp_sig
+                elif "Savitzky" in impl:
+                    window_length = layer['sg_window']
+                    if window_length % 2 == 0: window_length += 1
+                    polyorder = layer['sg_poly']
+                    if polyorder >= window_length: polyorder = window_length - 1
+                    filtered_signal = savgol_filter(filtered_signal, window_length, polyorder)
+                    
+            if np.any(np.isnan(filtered_signal)) or np.any(np.isinf(filtered_signal)):
+                self.filt_curve.setData([])
+                self.filt_time_plot.setTitle("Tín hiệu Đã lọc - LỖI: Bộ lọc không ổn định!")
+                if not silent:
+                    QMessageBox.warning(self, "Lỗi", "Tín hiệu sau lọc chứa NaN/Inf. Một trong số các bộ lọc không ổn định.")
+                return
+            
+            self.filt_time_plot.setTitle("Tín hiệu Đã lọc (Pipeline)")
+            self.filtered_signal_cache = filtered_signal
+            self.offline_signal = filtered_signal # Lưu đè offline signal cho Tab Analysis
+            self.orig_curve.setData(signal)
+            self.filt_curve.setData(filtered_signal)
+            
+            if not silent: QMessageBox.information(self, "Hoàn tất", f"Đã áp dụng toàn bộ chuỗi lọc.")
+            
+        except Exception as e:
+            self.filt_curve.setData([])
+            self.filt_time_plot.setTitle(f"Tín hiệu Đã lọc - LỖI: {str(e)}")
+            if not silent: QMessageBox.critical(self, "Lỗi lọc", f"Lỗi trong quá trình lọc tín hiệu: {str(e)}")
+
+    def export_c_code(self):
+        code = ""
+        count = 0
+        for i, layer in enumerate(self.filter_pipeline):
+            if not layer.get('is_active', True): continue
+            impl = layer['impl']
+            if "IIR" in impl or "FIR" in impl:
+                count += 1
+                code += f"// --- Layer {i+1}: {impl} ({layer['type']}) ---\n"
+                
+                if "FIR" in impl:
+                    b = layer.get('b')
+                    if b is None: continue
+                    code += f"#define FIR_LAYER{i+1}_TAPS {len(b)}\n"
+                    code += f"const float fir_layer{i+1}_taps[FIR_LAYER{i+1}_TAPS] = {{\n    "
+                    code += ", ".join([f"{x:.6e}" for x in b])
+                    code += "\n};\n\n"
+                else:
+                    sos = layer.get('sos')
+                    if sos is None: continue
+                    code += f"#define IIR_LAYER{i+1}_NUM_SECTIONS {len(sos)}\n"
+                    code += f"const float iir_layer{i+1}_sos[IIR_LAYER{i+1}_NUM_SECTIONS][6] = {{\n"
+                    for sec in sos:
+                        code += "    {" + ", ".join([f"{x:.6e}" for x in sec]) + "},\n"
+                    code += "};\n\n"
+                    
+        if count == 0:
+            QMessageBox.information(self, "Lưu ý", "Không có bộ lọc FIR/IIR nào đang Active trong Pipeline để xuất C/C++.")
+            return
+            
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton
+        dlg = QDialog(self)
+        dlg.setWindowTitle("C/C++ Code (Pipeline)")
+        dlg.resize(600, 400)
+        vbox = QVBoxLayout(dlg)
+        text = QTextEdit()
+        text.setPlainText(code)
+        text.setReadOnly(True)
+        vbox.addWidget(text)
+        btn = QPushButton("Đóng")
+        btn.clicked.connect(dlg.accept)
+        vbox.addWidget(btn)
+        dlg.exec()
+
+    def export_filtered_csv(self):
+        if not hasattr(self, 'filtered_signal_cache') or self.filtered_signal_cache is None:
+            QMessageBox.warning(self, "Lỗi", "Chưa có dữ liệu đã lọc.")
+            return
+            
+        path, _ = QFileDialog.getSaveFileName(self, "Lưu file CSV", "filtered_signal.csv", "CSV Files (*.csv)")
+        if path:
+            try:
+                original = -self.pure_offline_signal if self.cb_filter_invert.isChecked() else self.pure_offline_signal
+                df = pd.DataFrame({
+                    'Original': original,
+                    'Filtered': self.filtered_signal_cache
+                })
+                df.to_csv(path, index=False)
+                QMessageBox.information(self, "Thành công", f"Đã lưu kết quả tại: {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Lỗi", f"Không thể lưu file: {str(e)}")
         
     def update_ports(self):
         self.cb_ports.clear()
@@ -584,6 +1236,7 @@ class PPGAnalyzerSuite(QMainWindow):
                 return
                 
             self.offline_signal = signal
+            self.pure_offline_signal = np.copy(signal)
             self.offline_filename = os.path.basename(file_path)
             
             self.redraw_offline_raw()
@@ -688,31 +1341,31 @@ class PPGAnalyzerSuite(QMainWindow):
         self.deriv_ppg_plot.addItem(self.vLine_deriv_ppg, ignoreBounds=True)
         self.deriv_ppg_plot.addItem(self.label_deriv_ppg, ignoreBounds=True)
         
-        # 2. Tìm điểm đáy (Valleys / Diastolic feet) trên PPG gốc
-        valleys, _ = find_peaks(-signal_no_dc, distance=50, prominence=np.max(-signal_no_dc)*0.1)
+        # 2. Tìm điểm đỉnh (Peaks) trên PPG gốc
+        peaks, _ = find_peaks(signal_no_dc, distance=50, prominence=np.max(signal_no_dc)*0.1)
         scatter1 = pg.ScatterPlotItem(
-            x=valleys, y=signal[valleys], 
+            x=peaks, y=signal[peaks], 
             size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255)
         )
         scatter2 = pg.ScatterPlotItem(
-            x=valleys, y=signal[valleys], 
+            x=peaks, y=signal[peaks], 
             size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255)
         )
         # Thêm chấm đỏ vào cả 2 tab
         self.fft_ppg_plot.addItem(scatter1)
         self.deriv_ppg_plot.addItem(scatter2)
         
-        # Thêm đường dóng (Dashed Vertical Line) từ Đáy xuống đạo hàm
-        for p in valleys:
+        # Thêm đường dóng (Dashed Vertical Line) từ Đỉnh xuống đạo hàm
+        for p in peaks:
             line_pen = pg.mkPen('r', width=1, style=Qt.PenStyle.DashLine)
             self.deriv_ppg_plot.addItem(pg.InfiniteLine(pos=p, angle=90, pen=line_pen))
             self.vpg_plot.addItem(pg.InfiniteLine(pos=p, angle=90, pen=line_pen))
             self.apg_plot.addItem(pg.InfiniteLine(pos=p, angle=90, pen=line_pen))
         
-        # Tính BPM dựa trên khoảng cách giữa các đáy
+        # Tính BPM dựa trên khoảng cách giữa các đỉnh
         bpm = 0
-        if len(valleys) > 1:
-            intervals = np.diff(valleys) * 0.01 # Fs = 100Hz
+        if len(peaks) > 1:
+            intervals = np.diff(peaks) * 0.01 # Fs = 100Hz
             bpm = 60.0 / np.mean(intervals)
         
         title_str = f"Tín hiệu PPG Thô - {self.offline_filename} | Nhịp tim: {bpm:.1f} BPM"
