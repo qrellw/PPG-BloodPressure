@@ -218,9 +218,14 @@ class PPGAnalyzerSuite(QMainWindow):
         self.btn_load_csv = QPushButton("1. Chọn file CSV")
         self.btn_load_csv.clicked.connect(self.load_csv)
         
-        self.btn_analyze = QPushButton("2. Bắt đầu Phân tích")
+        self.btn_analyze = QPushButton("2. Phân tích (FFT & Đạo hàm)")
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.clicked.connect(self.analyze_data)
+        
+        self.btn_find_peaks = QPushButton("3. Tìm Đỉnh & Nhịp tim")
+        self.btn_find_peaks.setEnabled(False)
+        self.btn_find_peaks.clicked.connect(self.find_peaks_bpm)
+        self.btn_find_peaks.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
         
         self.cb_invert_offline = QCheckBox("Lật ngược tín hiệu")
         self.cb_invert_offline.stateChanged.connect(self.on_invert_changed)
@@ -233,6 +238,7 @@ class PPGAnalyzerSuite(QMainWindow):
         
         controls.addWidget(self.btn_load_csv)
         controls.addWidget(self.btn_analyze)
+        controls.addWidget(self.btn_find_peaks)
         controls.addWidget(self.cb_invert_offline)
         controls.addStretch()
         controls.addWidget(self.btn_export_fft)
@@ -1235,8 +1241,25 @@ class PPGAnalyzerSuite(QMainWindow):
                 signal = df['Gia_tri_PPG'].values
             elif 'Raw_IR' in df.columns:
                 signal = df['Raw_IR'].values
+            elif 'Original' in df.columns and 'Filtered' in df.columns:
+                # File dạng ma_filtered_signal.csv — cho người dùng chọn cột
+                from PyQt6.QtWidgets import QInputDialog
+                choices = ["Original (Tín hiệu gốc)", "Filtered (Tín hiệu đã lọc)"]
+                choice, ok = QInputDialog.getItem(
+                    self, "Chọn tín hiệu", 
+                    "File chứa cả tín hiệu Gốc và Đã lọc.\nBạn muốn tải cột nào?",
+                    choices, 0, False
+                )
+                if not ok:
+                    return
+                col = 'Original' if 'Original' in choice else 'Filtered'
+                signal = df[col].values
+            elif 'Original' in df.columns:
+                signal = df['Original'].values
+            elif 'Filtered' in df.columns:
+                signal = df['Filtered'].values
             else:
-                QMessageBox.warning(self, "Lỗi file", "Không tìm thấy cột 'Gia_tri_PPG' hoặc 'Raw_IR'.")
+                QMessageBox.warning(self, "Lỗi file", "Không tìm thấy cột dữ liệu PPG hợp lệ.\nCác cột được hỗ trợ: 'Gia_tri_PPG', 'Raw_IR', 'Original', 'Filtered'.")
                 return
                 
             self.offline_signal = signal
@@ -1247,6 +1270,7 @@ class PPGAnalyzerSuite(QMainWindow):
             
             self.btn_analyze.setEnabled(True)
             self.btn_analyze.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+            self.btn_find_peaks.setEnabled(True)
             
             # Tự động áp dụng Pipeline (nếu có) lên file mới
             if len(self.filter_pipeline) > 0 and self.cb_auto_preview.isChecked():
@@ -1353,8 +1377,53 @@ class PPGAnalyzerSuite(QMainWindow):
         self.deriv_ppg_plot.addItem(self.vLine_deriv_ppg, ignoreBounds=True)
         self.deriv_ppg_plot.addItem(self.label_deriv_ppg, ignoreBounds=True)
         
-        # 2. Tìm điểm đỉnh (Peaks) trên PPG gốc
-        peaks, _ = find_peaks(signal_no_dc, distance=50, prominence=np.max(signal_no_dc)*0.1)
+        # 2. Tính toán và vẽ FFT
+        Fs = 100
+        N = len(signal_no_dc)
+        T = 1.0 / Fs
+        
+        yf = scipy.fftpack.fft(signal_no_dc)
+        xf = np.linspace(0.0, 1.0/(2.0*T), N//2)
+        yf_abs = 2.0/N * np.abs(yf[:N//2])
+        
+        # Cập nhật curve FFT thay vì xóa đi tạo lại
+        self.fft_curve.setData(xf, yf_abs)
+        self.fft_widget.setXRange(0, 10) # Zoom mặc định từ 0 - 10Hz
+        
+        QMessageBox.information(self, "Hoàn tất", "Đã phân tích xong Phổ tần số và Đạo hàm.")
+
+    def find_peaks_bpm(self):
+        """Tìm đỉnh (Peaks) và tính nhịp tim (BPM) trên tín hiệu PPG."""
+        if self.offline_signal is None:
+            QMessageBox.warning(self, "Lỗi", "Chưa có dữ liệu. Vui lòng tải file CSV trước.")
+            return
+            
+        signal = self.offline_signal
+        if len(signal) < 100:
+            QMessageBox.warning(self, "Lỗi", "Dữ liệu quá ngắn (ít hơn 100 mẫu).")
+            return
+
+        # Lật ngược tín hiệu nếu có tick
+        if self.cb_invert_offline.isChecked():
+            signal = -signal
+
+        signal_no_dc = signal - np.mean(signal)
+        
+        # Tìm điểm đỉnh (Peaks) trên PPG gốc
+        peaks, properties = find_peaks(signal_no_dc, distance=50, prominence=np.max(signal_no_dc)*0.1)
+        
+        # Vẽ lại plot gốc rồi đè chấm đỏ lên
+        self.fft_ppg_plot.clear()
+        self.fft_ppg_plot.plot(signal, pen=pg.mkPen('purple', width=1.5))
+        self.fft_ppg_plot.addItem(self.vLine_fft_ppg, ignoreBounds=True)
+        self.fft_ppg_plot.addItem(self.label_fft_ppg, ignoreBounds=True)
+        
+        self.deriv_ppg_plot.clear()
+        self.deriv_ppg_plot.plot(signal, pen=pg.mkPen('purple', width=1.5))
+        self.deriv_ppg_plot.addItem(self.vLine_deriv_ppg, ignoreBounds=True)
+        self.deriv_ppg_plot.addItem(self.label_deriv_ppg, ignoreBounds=True)
+        
+        # Thêm chấm đỏ đánh dấu đỉnh vào cả 2 tab
         scatter1 = pg.ScatterPlotItem(
             x=peaks, y=signal[peaks], 
             size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255)
@@ -1363,7 +1432,6 @@ class PPGAnalyzerSuite(QMainWindow):
             x=peaks, y=signal[peaks], 
             size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255)
         )
-        # Thêm chấm đỏ vào cả 2 tab
         self.fft_ppg_plot.addItem(scatter1)
         self.deriv_ppg_plot.addItem(scatter2)
         
@@ -1380,24 +1448,11 @@ class PPGAnalyzerSuite(QMainWindow):
             intervals = np.diff(peaks) * 0.01 # Fs = 100Hz
             bpm = 60.0 / np.mean(intervals)
         
-        title_str = f"Tín hiệu PPG Thô - {self.offline_filename} | Nhịp tim: {bpm:.1f} BPM"
+        title_str = f"Tín hiệu PPG - {self.offline_filename} | Đỉnh: {len(peaks)} | Nhịp tim: {bpm:.1f} BPM"
         self.fft_ppg_plot.setTitle(title_str)
         self.deriv_ppg_plot.setTitle(title_str)
         
-        # 3. Tính toán và vẽ FFT
-        Fs = 100
-        N = len(signal_no_dc)
-        T = 1.0 / Fs
-        
-        yf = scipy.fftpack.fft(signal_no_dc)
-        xf = np.linspace(0.0, 1.0/(2.0*T), N//2)
-        yf_abs = 2.0/N * np.abs(yf[:N//2])
-        
-        # Cập nhật curve FFT thay vì xóa đi tạo lại
-        self.fft_curve.setData(xf, yf_abs)
-        self.fft_widget.setXRange(0, 10) # Zoom mặc định từ 0 - 10Hz
-        
-        QMessageBox.information(self, "Hoàn tất", "Đã phân tích xong Phổ tần số và Đạo hàm.")
+        QMessageBox.information(self, "Kết quả", f"Tìm thấy {len(peaks)} đỉnh.\nNhịp tim trung bình: {bpm:.1f} BPM")
 
     def export_fft(self):
         # Lưu hình ảnh của toàn bộ sub_tab_fft
