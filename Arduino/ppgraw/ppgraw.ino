@@ -7,6 +7,10 @@ MAX30105 particleSensor;
 const int I2C_SDA = 16; 
 const int I2C_SCL = 17;
 
+// Cài đặt thông số thời gian cho Sample Rate 100Hz
+unsigned long previousMicros = 0;
+const unsigned long intervalMicros = 10000; // 10,000 micro-giây = 10 mili-giây = 100Hz
+
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -16,27 +20,29 @@ void setup() {
     while (1);
   }
 
-  // Cấu hình Sample Rate 100Hz
+  // Cấu hình MAX30102: Sample Rate 100Hz
   particleSensor.setup(0x3F, 1, 2, 100, 411, 4096); 
   
-  // In ra Header cho file CSV (Chỉ in 1 cột duy nhất để dễ phân tích)
+  // In ra Header cho file CSV
   Serial.println("Raw_IR"); 
 }
 
 void loop() {
-  long irValue = particleSensor.getIR(); // Lấy tín hiệu thô từ đèn Hồng ngoại
+  unsigned long currentMicros = micros();
 
-  if (irValue > 50000) { // Cảm biến nhận diện có ngón tay
-    
-    // In thẳng giá trị thô ra Serial. 
-    // Serial Plotter sẽ tự động scale (co giãn) trục Y để hiển thị dao động.
-    Serial.println(irValue);
-    
-  } else {
-    // Không có ngón tay thì in ra 0
-    Serial.println(0); 
+  // Chỉ thực thi khi đã trôi qua đúng 10,000 micro-giây
+  if (currentMicros - previousMicros >= intervalMicros) {
+    // Cập nhật lại mốc thời gian. 
+    // Cộng dồn intervalMicros giúp bù trừ sai số thời gian thực thi lệnh
+    previousMicros += intervalMicros; 
+
+    long irValue = particleSensor.getIR(); // Lấy tín hiệu thô
+
+    if (irValue > 50000) { // Có ngón tay
+      Serial.println(irValue);
+    } else { // Không có ngón tay
+      Serial.println(0); 
+    }
   }
-
-  // Delay 10ms để duy trì tốc độ 100Hz
-  delay(10); 
+  
 }

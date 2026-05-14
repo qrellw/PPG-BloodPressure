@@ -411,7 +411,7 @@ class PPGAnalyzerSuite(QMainWindow):
         form_layout = QFormLayout(group_design)
         
         self.cb_filter_impl = QComboBox()
-        self.cb_filter_impl.addItems(["IIR (Butterworth)", "FIR", "Kalman (1D)", "Hampel", "Savitzky-Golay"])
+        self.cb_filter_impl.addItems(["IIR (Butterworth)", "FIR", "Kalman (1D)", "Hampel", "Savitzky-Golay", "EMA"])
         self.cb_filter_impl.currentIndexChanged.connect(self.on_filter_impl_changed)
         
         self.cb_filter_type = QComboBox()
@@ -504,6 +504,39 @@ class PPGAnalyzerSuite(QMainWindow):
         form_layout.addRow(self.label_sg_window, self.spin_sg_window)
         form_layout.addRow(self.label_sg_poly, self.spin_sg_poly)
         
+        # UI for EMA
+        self.spin_ema_span = QSpinBox()
+        self.spin_ema_span.setRange(2, 1000)
+        self.spin_ema_span.setValue(19)
+        self.spin_ema_span.setSuffix(" mẫu")
+        self.spin_ema_span.hide()
+        self.label_ema_span = QLabel("Span (N):")
+        self.label_ema_span.hide()
+        
+        self.spin_ema_alpha = QDoubleSpinBox()
+        self.spin_ema_alpha.setRange(0.001, 1.0)
+        self.spin_ema_alpha.setValue(0.1)
+        self.spin_ema_alpha.setDecimals(4)
+        self.spin_ema_alpha.setSingleStep(0.01)
+        self.spin_ema_alpha.hide()
+        self.label_ema_alpha = QLabel("Alpha (α):")
+        self.label_ema_alpha.hide()
+        
+        self.label_ema_info = QLabel("")
+        self.label_ema_info.setStyleSheet("color: #666; font-size: 11px;")
+        self.label_ema_info.hide()
+        self.label_ema_info_title = QLabel("")
+        self.label_ema_info_title.hide()
+        
+        # Bidirectional sync: Span <-> Alpha
+        self._ema_syncing = False
+        self.spin_ema_span.valueChanged.connect(self.on_ema_span_changed)
+        self.spin_ema_alpha.valueChanged.connect(self.on_ema_alpha_changed)
+        
+        form_layout.addRow(self.label_ema_span, self.spin_ema_span)
+        form_layout.addRow(self.label_ema_alpha, self.spin_ema_alpha)
+        form_layout.addRow(self.label_ema_info_title, self.label_ema_info)
+        
         # Auto Preview
         self.cb_filter_invert = QCheckBox("Lật ngược tín hiệu (Invert)")
         self.cb_auto_preview = QCheckBox("Tự động xem trước (Auto-Preview)")
@@ -535,7 +568,8 @@ class PPGAnalyzerSuite(QMainWindow):
         # Connect signals for auto-preview
         for widget in [self.cb_filter_impl, self.cb_filter_type, self.spin_order, self.spin_cutoff1, 
                        self.spin_cutoff2, self.spin_hampel_window, self.spin_hampel_sigma, 
-                       self.spin_kalman_r, self.spin_kalman_q, self.spin_sg_window, self.spin_sg_poly]:
+                       self.spin_kalman_r, self.spin_kalman_q, self.spin_sg_window, self.spin_sg_poly,
+                       self.spin_ema_span, self.spin_ema_alpha]:
             if isinstance(widget, QComboBox):
                 widget.currentIndexChanged.connect(self.on_param_changed)
             elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
@@ -603,6 +637,8 @@ class PPGAnalyzerSuite(QMainWindow):
             'kalman_q': 1e-4,
             'sg_window': 11,
             'sg_poly': 3,
+            'ema_span': 19,
+            'ema_alpha': 0.1,
             'is_active': True,
             'b': None, 'a': None, 'sos': None
         }
@@ -620,6 +656,8 @@ class PPGAnalyzerSuite(QMainWindow):
             'kalman_q': self.spin_kalman_q.value(),
             'sg_window': self.spin_sg_window.value(),
             'sg_poly': self.spin_sg_poly.value(),
+            'ema_span': self.spin_ema_span.value(),
+            'ema_alpha': self.spin_ema_alpha.value(),
             'is_active': True,
             'b': None, 'a': None, 'sos': None
         }
@@ -662,7 +700,7 @@ class PPGAnalyzerSuite(QMainWindow):
         for i, layer in enumerate(self.filter_pipeline):
             status = "[v]" if layer['is_active'] else "[ ]"
             name = f"{status} {layer['impl']} - {layer['type']}"
-            if layer['impl'] in ["Hampel", "Kalman (1D)", "Savitzky-Golay"]:
+            if layer['impl'] in ["Hampel", "Kalman (1D)", "Savitzky-Golay", "EMA"]:
                 name = f"{status} {layer['impl']}"
             item = QListWidgetItem(name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -704,6 +742,8 @@ class PPGAnalyzerSuite(QMainWindow):
         self.spin_kalman_q.setValue(layer['kalman_q'])
         self.spin_sg_window.setValue(layer['sg_window'])
         self.spin_sg_poly.setValue(layer['sg_poly'])
+        self.spin_ema_span.setValue(layer.get('ema_span', 19))
+        self.spin_ema_alpha.setValue(layer.get('ema_alpha', 0.1))
         self._is_populating = False
         self.on_filter_impl_changed()
 
@@ -721,6 +761,8 @@ class PPGAnalyzerSuite(QMainWindow):
             layer['kalman_q'] = self.spin_kalman_q.value()
             layer['sg_window'] = self.spin_sg_window.value()
             layer['sg_poly'] = self.spin_sg_poly.value()
+            layer['ema_span'] = self.spin_ema_span.value()
+            layer['ema_alpha'] = self.spin_ema_alpha.value()
             self.update_pipeline_list()
 
     def on_filter_impl_changed(self, *args):
@@ -729,6 +771,7 @@ class PPGAnalyzerSuite(QMainWindow):
         is_hampel = "Hampel" in impl
         is_kalman = "Kalman" in impl
         is_sg = "Savitzky" in impl
+        is_ema = impl == "EMA"
         
         self.cb_filter_type.setVisible(is_iir_fir)
         self.label_f_type.setVisible(is_iir_fir)
@@ -768,6 +811,15 @@ class PPGAnalyzerSuite(QMainWindow):
         self.spin_sg_poly.setVisible(is_sg)
         self.label_sg_poly.setVisible(is_sg)
         
+        self.spin_ema_alpha.setVisible(is_ema)
+        self.label_ema_alpha.setVisible(is_ema)
+        self.spin_ema_span.setVisible(is_ema)
+        self.label_ema_span.setVisible(is_ema)
+        self.label_ema_info.setVisible(is_ema)
+        self.label_ema_info_title.setVisible(is_ema)
+        if is_ema:
+            self.update_ema_info()
+        
         if not is_iir_fir:
             self.freq_plot.setTitle(f"Đáp ứng Biên độ (Không áp dụng cho {impl})")
             self.phase_plot.setTitle(f"Đáp ứng Pha (Không áp dụng cho {impl})")
@@ -776,6 +828,38 @@ class PPGAnalyzerSuite(QMainWindow):
         else:
             self.freq_plot.setTitle("Đáp ứng Biên độ (Magnitude)")
             self.phase_plot.setTitle("Đáp ứng Pha (Phase)")
+
+    def on_ema_span_changed(self, value):
+        """Khi Span thay đổi → tự tính Alpha = 2 / (N + 1)"""
+        if self._ema_syncing:
+            return
+        self._ema_syncing = True
+        alpha = 2.0 / (value + 1)
+        self.spin_ema_alpha.setValue(alpha)
+        self.update_ema_info()
+        self._ema_syncing = False
+
+    def on_ema_alpha_changed(self, value):
+        """Khi Alpha thay đổi → tự tính Span = round(2/α - 1)"""
+        if self._ema_syncing:
+            return
+        self._ema_syncing = True
+        if value > 0:
+            span = max(2, round(2.0 / value - 1))
+            self.spin_ema_span.setValue(span)
+        self.update_ema_info()
+        self._ema_syncing = False
+
+    def update_ema_info(self):
+        """Hiển thị thông tin tần số cắt tương đương của EMA"""
+        alpha = self.spin_ema_alpha.value()
+        fs = 100.0  # Tần số lấy mẫu
+        import math
+        if alpha > 0 and alpha < 1:
+            fc = -math.log(1 - alpha) * fs / (2 * math.pi)
+            self.label_ema_info.setText(f"fc ≈ {fc:.2f} Hz  (Fs={int(fs)}Hz)")
+        else:
+            self.label_ema_info.setText("—")
 
     def on_filter_type_changed(self, *args):
         f_type = self.cb_filter_type.currentText()
@@ -930,6 +1014,19 @@ class PPGAnalyzerSuite(QMainWindow):
                     polyorder = layer['sg_poly']
                     if polyorder >= window_length: polyorder = window_length - 1
                     filtered_signal = savgol_filter(filtered_signal, window_length, polyorder)
+                elif impl == "EMA":
+                    alpha = layer.get('ema_alpha', 0.1)
+                    # Forward pass
+                    fwd = np.zeros_like(filtered_signal)
+                    fwd[0] = filtered_signal[0]
+                    for i in range(1, len(filtered_signal)):
+                        fwd[i] = alpha * filtered_signal[i] + (1 - alpha) * fwd[i-1]
+                    # Backward pass (zero-phase)
+                    bwd = np.zeros_like(fwd)
+                    bwd[-1] = fwd[-1]
+                    for i in range(len(fwd) - 2, -1, -1):
+                        bwd[i] = alpha * fwd[i] + (1 - alpha) * bwd[i+1]
+                    filtered_signal = bwd
                     
             if np.any(np.isnan(filtered_signal)) or np.any(np.isinf(filtered_signal)):
                 self.filt_curve.setData([])
